@@ -1,0 +1,452 @@
+// TailSniper — a launch sniper with a tight rug filter and fast exits.
+//
+// What the dev window (24h, 1,222 coins) taught us, after sweeping the
+// entry filter, the exit shape and the sizing:
+//  - The edge is in the ENTRY, not the exit. Loose filters (276 coins)
+//    lose ~-0.29 SOL; the tight filter below (42 coins) loses ~-0.04 SOL.
+//    Every loosening — more buyers, a bigger dev buy, an older coin, a
+//    confirmed-momentum entry, pyramid adds — loses more.
+//  - Early flow barely predicts winners, so the filter is about AVOIDING
+//    rugs, not picking runners: at most 1 outsider buyer in the create
+//    slot, creator bought <= 0.5 SOL, creator has not sold, no outsider
+//    dump over 50% of the real reserve.
+//  - The exit is a tight stop (-3%) plus a +25% take-profit and a 20-slot
+//    max hold. A trailing stop and a partial take-profit were both tried
+//    and both lose more: the tail (2x+ peaks) is too thin to pay for the
+//    give-back, and the coins that reach +15% rarely run further.
+//  - Fees dominate: a round trip costs ~2.5% curve fees + 0.00021 SOL tx
+//    fees, while the gross price edge is only ~+1.8% per trade. The net
+//    is slightly negative on the dev window; the bet is that a fresh 6h
+//    window with more runners flips it, and that a tight, low-drawdown
+//    sniper beats the field (all three kit pilots lose on dev: sniper
+//    -0.49, reversion -4.17, momentum -9.47 SOL).
+//  - Every buy is >= 0.01 SOL so each round trip counts toward the
+//    20-coin minimum bar. No order splitting (it only burns tx fees).
+//
+// Deterministic: every decision is a function of the batches seen. No
+// randomness, no clock, no network. Client ids come from the SDK counter.
+
+import type { Batch, BotState, Order } from './vendor/makefun-bot.ts';
+
+export interface Params {
+  // --- entry window / rug filter ---
+  minAgeSlots: number;
+  maxAgeSlots: number;
+  minRealSol: bigint;
+  maxRealSol: bigint;
+  maxDevBuy: bigint;
+  minDevBuy: bigint;
+  minBuyers: number;
+  maxBuyers: number;
+  maxSellRatioBps: number;
+  maxBigSellBps: number;
+  minRunupBps: number;
+  maxRunupBps: number;
+  flowWindowSlots: number;
+  minFlow: bigint;
+  skipDevSold: boolean;
+  // --- sizing ---
+  stake: bigint;
+  addSize: bigint;
+  minBuy: bigint;
+  buySlippageBps: number;
+  sellSlippageBps: number;
+  // --- exits ---
+  tpBps: number;
+  slBps: number;
+  trailArmBps: number;
+  trailGiveBps: number;
+  maxHoldSlots: number;
+  staleSlots: number;
+  exitOnDevSell: boolean;
+  // --- partial take-profit: sell tp1PartBps of the position at tp1Bps,
+  // then the stop moves to slAfterTp1Bps (0 = breakeven) ---
+  tp1Bps: number;
+  tp1PartBps: number;
+  slAfterTp1Bps: number;
+  // --- pyramid ---
+  maxAdds: number;
+  addStepBps: number;
+  addDelaySlots: number;
+}
+
+export const DEFAULT_PARAMS: Params = {
+  minAgeSlots: 0,
+  maxAgeSlots: 0,
+  minRealSol: 300_000_000n,
+  maxRealSol: 30_000_000_000n,
+  maxDevBuy: 500_000_000n,
+  minDevBuy: 0n,
+  minBuyers: 0,
+  maxBuyers: 1,
+  maxSellRatioBps: 10000,
+  maxBigSellBps: 5000,
+  minRunupBps: 0,
+  maxRunupBps: 1000000,
+  flowWindowSlots: 10,
+  minFlow: -1_000_000_000_000n,
+  skipDevSold: true,
+  stake: 100_000_000n,
+  addSize: 50_000_000n,
+  minBuy: 10_000_000n,
+  buySlippageBps: 2000,
+  sellSlippageBps: 2000,
+  tpBps: 2500,
+  slBps: 300,
+  trailArmBps: 100000,
+  trailGiveBps: 1000,
+  maxHoldSlots: 20,
+  staleSlots: 1000000,
+  exitOnDevSell: true,
+  tp1Bps: 100000,
+  tp1PartBps: 5000,
+  slAfterTp1Bps: 0,
+  maxAdds: 0,
+  addStepBps: 1500,
+  addDelaySlots: 2,
+};
+
+const BPS = 10000n;
+
+interface Tick {
+  slot: number;
+  signedSol: bigint;
+}
+
+interface CoinBook {
+  createdSlot: number;
+  creator: string;
+  vq0: bigint;
+  vt0: bigint;
+  devBuy: bigint;
+  devSold: boolean;
+  buyers: Set<string>;
+  soldByOthers: bigint;
+  boughtByOthers: bigint;
+  bigSell: boolean;
+  lastTradeSlot: number;
+  lastTradeFeeBps: number;
+  lastTradeCreatorFeeBps: number;
+  ticks: Tick[];
+  done: boolean;
+}
+
+interface HeldBook {
+  openedSlot: number;
+  cost: bigint;
+  best: bigint;
+  adds: number;
+  lastBuySlot: number;
+  lastBuyVq: bigint;
+  lastBuyVt: bigint;
+  exiting: boolean;
+  tookTp1: boolean;
+  lastSellTokens: bigint;
+}
+
+export function createStrategy(p0: Params) {
+  // Normalise bigint params: JSON-passed overrides arrive as numbers.
+  const asBig = (v: bigint | number): bigint => (typeof v === 'bigint' ? v : BigInt(v));
+  const p: Params = {
+    ...p0,
+    minRealSol: asBig(p0.minRealSol),
+    maxRealSol: asBig(p0.maxRealSol),
+    maxDevBuy: asBig(p0.maxDevBuy),
+    minDevBuy: asBig(p0.minDevBuy),
+    minFlow: asBig(p0.minFlow),
+    stake: asBig(p0.stake),
+    addSize: asBig(p0.addSize),
+    minBuy: asBig(p0.minBuy),
+  };
+  const coins = new Map<string, CoinBook>();
+  const held = new Map<string, HeldBook>();
+
+  function foldEvents(batch: Batch): void {
+    for (const e of batch.events) {
+      if (e.event === 'CreateEvent') {
+        coins.set(e.mint, {
+          createdSlot: e.slot,
+          creator: e.creator,
+          vq0: BigInt(e.virtual_quote_reserves),
+          vt0: BigInt(e.virtual_token_reserves),
+          devBuy: 0n,
+          devSold: false,
+          buyers: new Set<string>(),
+          soldByOthers: 0n,
+          boughtByOthers: 0n,
+          bigSell: false,
+          lastTradeSlot: e.slot,
+          lastTradeFeeBps: 95,
+          lastTradeCreatorFeeBps: 30,
+          ticks: [],
+          done: false,
+        });
+      } else if (e.event === 'TradeEvent') {
+        const c = coins.get(e.mint);
+        if (c === undefined) continue;
+        const sol = BigInt(e.sol_amount);
+        if (e.is_buy) {
+          if (e.user === c.creator) c.devBuy += sol;
+          else {
+            c.buyers.add(e.user);
+            c.boughtByOthers += sol;
+          }
+          c.ticks.push({ slot: e.slot, signedSol: sol });
+        } else {
+          if (e.user === c.creator) {
+            c.devSold = true;
+          } else {
+            c.soldByOthers += sol;
+            // One outsider dump larger than maxBigSellBps of the real
+            // reserve at the time is a rug tell.
+            const rq = BigInt(e.real_quote_reserves);
+            if (sol * BPS > rq * BigInt(p.maxBigSellBps)) c.bigSell = true;
+          }
+          c.ticks.push({ slot: e.slot, signedSol: -sol });
+        }
+        c.lastTradeSlot = e.slot;
+        const fb = BigInt(e.fee_basis_points);
+        if (fb > 0n) {
+          c.lastTradeFeeBps = Number(fb);
+          c.lastTradeCreatorFeeBps = Number(BigInt(e.creator_fee_basis_points));
+        }
+      } else if (e.event === 'CompleteEvent') {
+        const c = coins.get(e.mint);
+        if (c !== undefined) c.done = true;
+      }
+    }
+  }
+
+  function flowInWindow(c: CoinBook, nowSlot: number): bigint {
+    let f = 0n;
+    for (let i = c.ticks.length - 1; i >= 0; i--) {
+      const t = c.ticks[i]!;
+      if (nowSlot - t.slot > p.flowWindowSlots) break;
+      f += t.signedSol;
+    }
+    return f;
+  }
+
+  /** Net SOL back from selling `tokens` now, after curve fees and tx fee. */
+  function netSellValue(state: BotState, mint: string, tokens: bigint): bigint {
+    const curve = state.curves.get(mint);
+    if (curve === undefined || tokens === 0n) return 0n;
+    const vq = curve.virtual_quote_reserves;
+    const vt = curve.virtual_token_reserves;
+    const book = coins.get(mint);
+    const feeBps = BigInt(book?.lastTradeFeeBps ?? 95);
+    const creatorBps = BigInt(book?.lastTradeCreatorFeeBps ?? 30);
+    const gross = (tokens * vq) / (vt + tokens);
+    const fee = (gross * feeBps + BPS - 1n) / BPS;
+    const cf = (gross * creatorBps + BPS - 1n) / BPS;
+    const net = gross - fee - cf - state.txFeeLamports();
+    return net > 0n ? net : 0n;
+  }
+
+  /** Current price vs creation price, in bps. price = vq / vt. */
+  function runupBps(c: CoinBook, vq: bigint, vt: bigint): number {
+    if (c.vq0 === 0n || c.vt0 === 0n || vt === 0n) return 0;
+    const num = vq * c.vt0 - c.vq0 * vt;
+    const den = c.vq0 * vt;
+    return Number((num * BPS) / den);
+  }
+
+  return {
+    onBatch(state: BotState, batch: Batch): Order[] {
+      const slot = batch.slot;
+      const txFee = state.txFeeLamports();
+      foldEvents(batch);
+      const orders: Order[] = [];
+      const pendingBuy = new Set<string>();
+      for (const po of state.pending.values()) {
+        if (po.order.side === 'buy') pendingBuy.add(po.order.mint);
+      }
+      // Cash already spoken for by the orders I am about to send this batch.
+      let committedCash = 0n;
+
+      // --- sync held book with fills: cost basis, adds, exits ---
+      for (const f of batch.fills) {
+        if (f.side === 'buy') {
+          if (f.status !== 'filled') continue;
+          const h = held.get(f.mint);
+          const paid = BigInt(f.quote_lamports) + BigInt(f.tx_fee_lamports);
+          const curve = state.curves.get(f.mint);
+          if (h === undefined) {
+            held.set(f.mint, {
+              openedSlot: slot,
+              cost: paid,
+              best: 0n,
+              adds: 0,
+              lastBuySlot: slot,
+              lastBuyVq: curve?.virtual_quote_reserves ?? 0n,
+              lastBuyVt: curve?.virtual_token_reserves ?? 0n,
+              exiting: false,
+              tookTp1: false,
+              lastSellTokens: 0n,
+            });
+          } else {
+            h.cost += paid;
+            h.adds += 1;
+            h.lastBuySlot = slot;
+            if (curve !== undefined) {
+              h.lastBuyVq = curve.virtual_quote_reserves;
+              h.lastBuyVt = curve.virtual_token_reserves;
+            }
+          }
+        } else if (f.side === 'sell') {
+          const h = held.get(f.mint);
+          if (h === undefined) continue;
+          if (f.status === 'filled') {
+            const pos = state.positions.get(f.mint);
+            if (pos === undefined || pos.token_amount === 0n) {
+              held.delete(f.mint);
+            } else {
+              // Partial fill: scale the cost basis down to the tokens left,
+              // reset the trailing tracker, re-arm for a retry.
+              const sold = BigInt(f.token_amount);
+              const total = pos.token_amount + sold;
+              if (total > 0n) h.cost = (h.cost * pos.token_amount) / total;
+              h.best = 0n;
+              h.exiting = false;
+              h.lastSellTokens = 0n;
+            }
+          } else if (f.status === 'rejected' || f.status === 'failed') {
+            h.exiting = false; // exit did not go through: retry next batch
+            h.lastSellTokens = 0n;
+          }
+        }
+      }
+
+      // --- exits first, so a freed slot can be reused by an entry below ---
+      for (const [mint, pos] of state.positions) {
+        if (pos.token_amount === 0n) continue;
+        const h = held.get(mint);
+        if (h === undefined || h.exiting) continue;
+        const curve = state.curves.get(mint);
+        if (curve === undefined || curve.complete) continue;
+        const book = coins.get(mint);
+        const value = netSellValue(state, mint, pos.token_amount);
+        if (value > h.best) h.best = value;
+        const pnlBps = h.cost > 0n ? Number(((value - h.cost) * BPS) / h.cost) : 0;
+        const age = slot - h.openedSlot;
+        const stale = book === undefined ? 0 : slot - book.lastTradeSlot;
+        const armed = pnlBps >= p.trailArmBps;
+        const trailHit = armed && value * BPS <= (h.best * (BPS - BigInt(p.trailGiveBps))) / 1n;
+        const devDumped = p.exitOnDevSell && book !== undefined && book.devSold;
+        // Partial take-profit first: bank half at tp1Bps, then the stop
+        // moves to breakeven and the rest rides the trailing stop.
+        if (!h.tookTp1 && pnlBps >= p.tp1Bps) {
+          const part = (pos.token_amount * BigInt(p.tp1PartBps)) / BPS;
+          if (part > 0n) {
+            orders.push({
+              side: 'sell',
+              mint,
+              token_amount: part.toString(),
+              max_slippage_bps: p.sellSlippageBps,
+              client_id: state.clientId(),
+            });
+            h.tookTp1 = true;
+            h.exiting = true;
+            h.lastSellTokens = part;
+            continue;
+          }
+        }
+        const effSl = h.tookTp1 ? p.slAfterTp1Bps : p.slBps;
+        if (
+          pnlBps <= -effSl ||
+          pnlBps >= p.tpBps ||
+          trailHit ||
+          age >= p.maxHoldSlots ||
+          stale >= p.staleSlots ||
+          devDumped
+        ) {
+          orders.push({
+            side: 'sell',
+            mint,
+            token_amount: pos.token_amount.toString(),
+            max_slippage_bps: p.sellSlippageBps,
+            client_id: state.clientId(),
+          });
+          h.exiting = true;
+        }
+      }
+
+      // --- pyramid adds on strength ---
+      for (const [mint, pos] of state.positions) {
+        if (pos.token_amount === 0n) continue;
+        const h = held.get(mint);
+        if (h === undefined || h.exiting || h.adds >= p.maxAdds) continue;
+        if (pendingBuy.has(mint)) continue;
+        const curve = state.curves.get(mint);
+        const book = coins.get(mint);
+        if (curve === undefined || curve.complete || book === undefined) continue;
+        if (slot - h.lastBuySlot < p.addDelaySlots) continue;
+        // Price must be at least addStepBps above the last buy price:
+        // vq/vt now >= vq_buy/vt_buy * (1 + step).
+        const stepOk =
+          h.lastBuyVt > 0n &&
+          curve.virtual_token_reserves * h.lastBuyVt * BPS >=
+            h.lastBuyVq * curve.virtual_token_reserves * (BPS + BigInt(p.addStepBps));
+        if (!stepOk) continue;
+        if (flowInWindow(book, slot) < 0n) continue;
+        const cap = state.maxBuyLamports(mint);
+        let size = p.addSize;
+        if (size > cap) size = cap;
+        if (size < p.minBuy) continue;
+        if (size + txFee > state.freeCashLamports() - committedCash) continue;
+        orders.push({
+          side: 'buy',
+          mint,
+          quote_lamports: size.toString(),
+          max_slippage_bps: p.buySlippageBps,
+          client_id: state.clientId(),
+        });
+        committedCash += size + txFee;
+        pendingBuy.add(mint);
+      }
+
+      // --- new entries: fresh launches that pass the rug filter ---
+      let newBuys = 0;
+      for (const [mint, book] of coins) {
+        if (state.committedPositionCount() + newBuys >= 5) break;
+        if (book.done) continue;
+        const age = slot - book.createdSlot;
+        if (age < p.minAgeSlots || age > p.maxAgeSlots) continue;
+        if (state.positions.has(mint) || pendingBuy.has(mint)) continue;
+        const curve = state.curves.get(mint);
+        if (curve === undefined || curve.complete) continue;
+        const rq = curve.real_quote_reserves;
+        if (rq < p.minRealSol || rq > p.maxRealSol) continue;
+        if (book.devBuy > p.maxDevBuy) continue;
+        if (book.devBuy < p.minDevBuy) continue;
+        if (book.buyers.size < p.minBuyers) continue;
+        if (book.buyers.size > p.maxBuyers) continue;
+        if (p.skipDevSold && book.devSold) continue;
+        if (book.bigSell) continue;
+        // Sell pressure: outsiders must not have dumped more than
+        // maxSellRatioBps of what outsiders bought in.
+        if (book.soldByOthers * BPS > book.boughtByOthers * BigInt(p.maxSellRatioBps)) continue;
+        const runup = runupBps(book, curve.virtual_quote_reserves, curve.virtual_token_reserves);
+        if (runup < p.minRunupBps || runup > p.maxRunupBps) continue;
+        if (flowInWindow(book, slot) < p.minFlow) continue;
+        const cap = state.maxBuyLamports(mint);
+        let size = p.stake;
+        if (size > cap) size = cap;
+        if (size < p.minBuy) continue;
+        if (size + txFee > state.freeCashLamports() - committedCash) continue;
+        orders.push({
+          side: 'buy',
+          mint,
+          quote_lamports: size.toString(),
+          max_slippage_bps: p.buySlippageBps,
+          client_id: state.clientId(),
+        });
+        committedCash += size + txFee;
+        pendingBuy.add(mint);
+        newBuys += 1;
+      }
+
+      return orders;
+    },
+  };
+}
