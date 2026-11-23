@@ -1,30 +1,14 @@
-// TailSniper — a launch sniper with a tight rug filter and fast exits.
+// DipSniper — an early-dip sniper with momentum pyramid adds.
 //
-// What the dev window (24h, 1,222 coins) taught us, after sweeping the
-// entry filter, the exit shape and the sizing:
-//  - The edge is in the ENTRY, not the exit. Loose filters (276 coins)
-//    lose ~-0.29 SOL; the tight filter below (42 coins) loses ~-0.04 SOL.
-//    Every loosening — more buyers, a bigger dev buy, an older coin, a
-//    confirmed-momentum entry, pyramid adds — loses more.
-//  - Early flow barely predicts winners, so the filter is about AVOIDING
-//    rugs, not picking runners: at most 1 outsider buyer in the create
-//    slot, creator bought <= 0.5 SOL, creator has not sold, no outsider
-//    dump over 50% of the real reserve.
-//  - The exit is a tight stop (-3%) plus a +25% take-profit and a 20-slot
-//    max hold. A trailing stop and a partial take-profit were both tried
-//    and both lose more: the tail (2x+ peaks) is too thin to pay for the
-//    give-back, and the coins that reach +15% rarely run further.
-//  - Fees dominate: a round trip costs ~2.5% curve fees + 0.00021 SOL tx
-//    fees, while the gross price edge is only ~+1.8% per trade. The net
-//    is slightly negative on the dev window; the bet is that a fresh 6h
-//    window with more runners flips it, and that a tight, low-drawdown
-//    sniper beats the field (all three kit pilots lose on dev: sniper
-//    -0.49, reversion -4.17, momentum -9.47 SOL).
-//  - Every buy is >= 0.01 SOL so each round trip counts toward the
-//    20-coin minimum bar. No order splitting (it only burns tx fees).
-//
-// Deterministic: every decision is a function of the batches seen. No
-// randomness, no clock, no network. Client ids come from the SDK counter.
+// Buys pump.fun coins aged 1-5 slots that have fallen at least dipMinBps
+// (vs creation price) from their peak runup, after the v1 rug filter
+// (real SOL 0.3-30, creator buy <= 0.5 SOL, creator not sold, no outsider
+// dump > 50% of reserve). Exits: stop -3%, take-profit +40%, max hold 20
+// slots, exit if creator sells. Winners get up to 2 pyramid adds of 0.1
+// SOL on +15% strength steps. The dip book is where the runners live:
+// the age-0 sniper book never reaches +40%, but dip coins do, and adds
+// into strength pay. Deterministic: decisions are a function of the
+// batches seen. No randomness, no clock, no network.
 
 import type { Batch, BotState, Order } from './vendor/makefun-bot.ts';
 
@@ -68,11 +52,33 @@ export interface Params {
   maxAdds: number;
   addStepBps: number;
   addDelaySlots: number;
+  // --- (a) shareholder concentration: reject when the latest reported
+  // top holder exceeds maxTopShareBps, or fewer than minHolders are
+  // reported. Only applies when shareholders data exists (holderCount>0);
+  // defaults (10000 / 0) disable the filter. ---
+  maxTopShareBps: number;
+  minHolders: number;
+  // --- (b) stake-by-signal tiers: stakeStrong when outsiders bought at
+  // least strongBuyThr in the create slot, stakeWeak when they bought at
+  // most weakBuyThr. Threshold 0 = tier off; defaults equal stake. ---
+  stakeWeak: bigint;
+  stakeStrong: bigint;
+  strongBuyThr: bigint;
+  weakBuyThr: bigint;
+  // --- (c) dip-buying: only active when minAgeSlots > 0; entry requires
+  // the price to have fallen at least dipMinBps (vs creation price) from
+  // its peak runup. ---
+  dipMinBps: number;
+  // --- dual book: entries aged > 0 slots use maxBuyersDip instead of
+  // maxBuyers, so an age-0 sniper book and a dip book can run together
+  // (minAgeSlots 0, maxAgeSlots 5, dipMinBps > 0, maxBuyers 1,
+  // maxBuyersDip 100). Default 1 = same as maxBuyers. ---
+  maxBuyersDip: number;
 }
 
 export const DEFAULT_PARAMS: Params = {
-  minAgeSlots: 0,
-  maxAgeSlots: 0,
+  minAgeSlots: 1,
+  maxAgeSlots: 5,
   minRealSol: 300_000_000n,
   maxRealSol: 30_000_000_000n,
   maxDevBuy: 500_000_000n,
@@ -87,11 +93,11 @@ export const DEFAULT_PARAMS: Params = {
   minFlow: -1_000_000_000_000n,
   skipDevSold: true,
   stake: 100_000_000n,
-  addSize: 50_000_000n,
+  addSize: 100_000_000n,
   minBuy: 10_000_000n,
   buySlippageBps: 2000,
   sellSlippageBps: 2000,
-  tpBps: 2500,
+  tpBps: 4000,
   slBps: 300,
   trailArmBps: 100000,
   trailGiveBps: 1000,
@@ -101,9 +107,17 @@ export const DEFAULT_PARAMS: Params = {
   tp1Bps: 100000,
   tp1PartBps: 5000,
   slAfterTp1Bps: 0,
-  maxAdds: 0,
+  maxAdds: 2,
   addStepBps: 1500,
   addDelaySlots: 2,
+  maxTopShareBps: 10000,
+  minHolders: 0,
+  stakeWeak: 100_000_000n,
+  stakeStrong: 100_000_000n,
+  strongBuyThr: 0n,
+  weakBuyThr: 0n,
+  dipMinBps: 1500,
+  maxBuyersDip: 100,
 };
 
 const BPS = 10000n;
@@ -129,6 +143,11 @@ interface CoinBook {
   lastTradeCreatorFeeBps: number;
   ticks: Tick[];
   done: boolean;
+  // (a) latest reported shareholders (0 holders = never reported)
+  topShareBps: number;
+  holderCount: number;
+  // (c) peak price vs creation price, in bps (updated per TradeEvent)
+  peakRunupBps: number;
 }
 
 interface HeldBook {
@@ -157,6 +176,10 @@ export function createStrategy(p0: Params) {
     stake: asBig(p0.stake),
     addSize: asBig(p0.addSize),
     minBuy: asBig(p0.minBuy),
+    stakeWeak: asBig(p0.stakeWeak),
+    stakeStrong: asBig(p0.stakeStrong),
+    strongBuyThr: asBig(p0.strongBuyThr),
+    weakBuyThr: asBig(p0.weakBuyThr),
   };
   const coins = new Map<string, CoinBook>();
   const held = new Map<string, HeldBook>();
@@ -180,11 +203,32 @@ export function createStrategy(p0: Params) {
           lastTradeCreatorFeeBps: 30,
           ticks: [],
           done: false,
+          topShareBps: 0,
+          holderCount: 0,
+          peakRunupBps: 0,
         });
       } else if (e.event === 'TradeEvent') {
         const c = coins.get(e.mint);
         if (c === undefined) continue;
         const sol = BigInt(e.sol_amount);
+        // (a) shareholders: only non-empty reports carry signal; an empty
+        // array means "not reported", not "no holders", so keep last known.
+        const sh = (e as any).shareholders as Array<{ address: string; share_bps: number }> | undefined;
+        if (sh !== undefined && sh.length > 0) {
+          c.holderCount = sh.length;
+          let top = 0;
+          for (const h of sh) if (h.share_bps > top) top = h.share_bps;
+          c.topShareBps = top;
+        }
+        // (c) track peak runup from this trade's virtual reserves.
+        if (c.vq0 > 0n && c.vt0 > 0n) {
+          const vq = BigInt(e.virtual_quote_reserves);
+          const vt = BigInt(e.virtual_token_reserves);
+          if (vt > 0n) {
+            const r = Number(((vq * c.vt0 - c.vq0 * vt) * BPS) / (c.vq0 * vt));
+            if (r > c.peakRunupBps) c.peakRunupBps = r;
+          }
+        }
         if (e.is_buy) {
           if (e.user === c.creator) c.devBuy += sol;
           else {
@@ -420,17 +464,28 @@ export function createStrategy(p0: Params) {
         if (book.devBuy > p.maxDevBuy) continue;
         if (book.devBuy < p.minDevBuy) continue;
         if (book.buyers.size < p.minBuyers) continue;
-        if (book.buyers.size > p.maxBuyers) continue;
+        if (book.buyers.size > (age === 0 ? p.maxBuyers : p.maxBuyersDip)) continue;
         if (p.skipDevSold && book.devSold) continue;
         if (book.bigSell) continue;
+        // (a) shareholder concentration (only when data was reported).
+        if (book.holderCount > 0) {
+          if (book.topShareBps > p.maxTopShareBps) continue;
+          if (book.holderCount < p.minHolders) continue;
+        }
         // Sell pressure: outsiders must not have dumped more than
         // maxSellRatioBps of what outsiders bought in.
         if (book.soldByOthers * BPS > book.boughtByOthers * BigInt(p.maxSellRatioBps)) continue;
         const runup = runupBps(book, curve.virtual_quote_reserves, curve.virtual_token_reserves);
         if (runup < p.minRunupBps || runup > p.maxRunupBps) continue;
+        // (c) dip-buying: aged entries require a fall of at least
+        // dipMinBps from the peak runup (only when dipMinBps > 0).
+        if (age > 0 && p.dipMinBps > 0 && book.peakRunupBps - runup < p.dipMinBps) continue;
         if (flowInWindow(book, slot) < p.minFlow) continue;
         const cap = state.maxBuyLamports(mint);
+        // (b) stake-by-signal tiers on outsider buys in the create slot.
         let size = p.stake;
+        if (p.strongBuyThr > 0n && book.boughtByOthers >= p.strongBuyThr) size = p.stakeStrong;
+        else if (p.weakBuyThr > 0n && book.boughtByOthers <= p.weakBuyThr) size = p.stakeWeak;
         if (size > cap) size = cap;
         if (size < p.minBuy) continue;
         if (size + txFee > state.freeCashLamports() - committedCash) continue;
