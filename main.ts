@@ -1,6 +1,9 @@
 // DipSniper — Pump Sprint entry v2.
 //
-// An early-dip sniper with momentum pyramid adds. It buys pump.fun coins
+// Revision note (main session): v2 keeps the v1 rug filter and launch
+// sniper book, but the edge moved to early dips — coins aged 1-5 slots
+// that fell >=15% from their peak runup. The pyramid adds (2x0.1 SOL)
+// only fire on winners already past +15%; losers never get topped up.
 // aged 1-5 slots that have fallen at least 15% (dipMinBps 1500) from
 // their peak runup, after the v1 rug filter (real SOL 0.3-30, creator
 // buy <= 0.5 SOL, creator has not sold, no outsider dump > 50% of
